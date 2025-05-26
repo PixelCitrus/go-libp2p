@@ -9,6 +9,8 @@ import (
 	mrand "math/rand"
 	"os"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/libp2p/go-libp2p"
 	"github.com/libp2p/go-libp2p/core/crypto"
@@ -33,6 +35,8 @@ var (
 	relayAddr  = flag.String("relay", "", "中继节点地址")
 	rendezvous = flag.String("rendezvous", "chat-with-relay", "节点发现标识")
 	debug      = flag.Bool("debug", false, "调试模式生成固定节点ID")
+
+	streams sync.Map // 维护持久化流
 )
 
 type discoveryNotifee struct {
@@ -40,8 +44,18 @@ type discoveryNotifee struct {
 }
 
 func (n *discoveryNotifee) HandlePeerFound(pi peer.AddrInfo) {
+	// 添加中继地址到发现的节点
+	if *relayAddr != "" {
+		relayMA, _ := ma.NewMultiaddr(*relayAddr)
+		pi.Addrs = append(pi.Addrs, relayMA)
+	}
+
 	fmt.Printf("发现新节点: %s\n", pi.ID)
-	if err := n.host.Connect(context.Background(), pi); err != nil {
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	if err := n.host.Connect(ctx, pi); err != nil {
 		fmt.Printf("连接失败: %v\n", err)
 	}
 }
@@ -56,6 +70,8 @@ func main() {
 			fmt.Sprintf("/ip6/::/tcp/%d", *port)),
 		libp2p.EnableRelay(),
 		libp2p.NATPortMap(),
+		libp2p.EnableNATService(),
+		libp2p.Ping(true),
 	}
 
 	if *debug {
@@ -104,6 +120,7 @@ func createPeerNode(ctx context.Context, opts []libp2p.Option) {
 		fmt.Println(" ", addr)
 	}
 
+	go monitorConnections(h)
 	go readConsoleInput(h)
 	select {}
 }
@@ -131,25 +148,30 @@ func connectToRelay(h host.Host) {
 	}
 
 	h.Peerstore().AddAddrs(relayInfo.ID, relayInfo.Addrs, peerstore.PermanentAddrTTL)
-	if err := h.Connect(context.Background(), *relayInfo); err != nil {
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	if err := h.Connect(ctx, *relayInfo); err != nil {
 		log.Fatal("连接中继失败:", err)
 	}
 }
 
 func setupChatProtocol(h host.Host) {
 	h.SetStreamHandler(chatProtocol, func(s network.Stream) {
-		defer s.Close()
 		fmt.Printf("\n新连接来自: %s\n> ", s.Conn().RemotePeer())
 		go readStream(s)
 	})
 }
 
 func readStream(s network.Stream) {
+	defer s.Close()
 	r := bufio.NewReader(s)
 	for {
 		msg, err := r.ReadString('\n')
 		if err != nil {
 			fmt.Printf("\n连接 %s 已关闭\n> ", s.Conn().RemotePeer())
+			streams.Delete(s.Conn().RemotePeer())
 			return
 		}
 		fmt.Printf("\n[来自 %s] %s> ", s.Conn().RemotePeer(), msg)
@@ -168,18 +190,7 @@ func readConsoleInput(h host.Host) {
 			continue
 		}
 
-		conns := h.Network().Conns()
-		for _, c := range conns {
-			if c.RemotePeer() == h.ID() {
-				continue
-			}
-			s, err := h.NewStream(context.Background(), c.RemotePeer(), chatProtocol)
-			if err != nil {
-				continue
-			}
-			defer s.Close()
-			s.Write([]byte(msg + "\n"))
-		}
+		broadcastMessage(h, msg)
 	}
 }
 
@@ -197,7 +208,11 @@ func connectToPeer(h host.Host, addr string) {
 	}
 
 	h.Peerstore().AddAddrs(peerInfo.ID, peerInfo.Addrs, peerstore.PermanentAddrTTL)
-	if err := h.Connect(context.Background(), *peerInfo); err != nil {
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	if err := h.Connect(ctx, *peerInfo); err != nil {
 		fmt.Println("连接失败:", err)
 	}
 }
@@ -212,4 +227,50 @@ func genDebugKey(port int) crypto.PrivKey {
 		panic(err)
 	}
 	return priv
+}
+
+func broadcastMessage(h host.Host, msg string) {
+	peers := h.Network().Peers()
+	for _, p := range peers {
+		if p == h.ID() {
+			continue
+		}
+
+		// 获取或创建持久化流
+		s, ok := streams.Load(p)
+		if !ok {
+			var err error
+			s, err = h.NewStream(context.Background(), p, chatProtocol)
+			if err != nil {
+				fmt.Printf("无法创建流到 %s: %v\n", p, err)
+				continue
+			}
+			streams.Store(p, s)
+			go readStream(s.(network.Stream))
+		}
+
+		_, err := s.(network.Stream).Write([]byte(msg + "\n"))
+		if err != nil {
+			fmt.Printf("发送失败到 %s: %v\n", p, err)
+			streams.Delete(p)
+		}
+	}
+}
+
+func monitorConnections(h host.Host) {
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+
+	for range ticker.C {
+		fmt.Println("\n当前连接状态:")
+		fmt.Printf("中继地址: %s\n", *relayAddr)
+		fmt.Println("活跃节点:")
+		for _, p := range h.Network().Peers() {
+			if p == h.ID() {
+				continue
+			}
+			fmt.Printf("  %s\n", p)
+		}
+		fmt.Print("> ")
+	}
 }
