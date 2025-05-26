@@ -52,6 +52,12 @@ go build -o chat
 - `-relay`: 中继节点的地址（当 mode 为 peer 时使用）
 - `-rendezvous`: 用于节点发现的标识字符串，默认为 "chat-with-relay"
 
+
+用户命令更新：
+控制台输入现在支持 /list_active 命令，用于向中继节点请求活跃节点列表。
+引入 /send <目标PeerID> <消息> 命令，用户必须指定 Peer ID 才能发送消息。
+/peers 命令现在只显示本地直接连接的对等节点，不再包括中继。
+
 ## 工作原理
 
 1. 程序启动时，根据 mode 参数决定是作为中继节点还是普通节点运行
