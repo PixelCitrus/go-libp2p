@@ -262,9 +262,6 @@ func readStream(s network.Stream) {
 		// 判断接收到的消息是通过直接连接还是中继
 		conn := s.Conn()
 		isRelayed := false
-		// 检查连接的远程地址是否包含 p2p-circuit 段
-		// 或者检查连接的传输协议是否是 circuitv2
-		// RemoteMultiaddr() 会给出实际使用的传输地址
 		remoteAddr := conn.RemoteMultiaddr()
 		if remoteAddr != nil && strings.Contains(remoteAddr.String(), "/p2p-circuit") {
 			isRelayed = true
@@ -310,22 +307,27 @@ func readConsoleInput(h host.Host) {
 				continue
 			}
 			sendMessage(h, targetPeerID, message)
-		case "/connect": // 允许用户主动连接其他对等节点（可能通过它们的multiaddr）
+		case "/connect": // **修改点：现在接受 Peer ID**
 			if len(parts) < 2 {
-				fmt.Println("用法: /connect <multiaddr>")
+				fmt.Println("用法: /connect <目标PeerID>")
 				continue
 			}
-			connectToPeer(h, parts[1])
+			targetPeerIDStr := parts[1]
+			targetPeerID, err := peer.Decode(targetPeerIDStr)
+			if err != nil {
+				fmt.Printf("无效的Peer ID: %v\n", err)
+				continue
+			}
+			connectToPeerByID(h, targetPeerID) // 调用新函数
 		case "/peers": // 显示本地已连接的对等节点
 			fmt.Println("本地已连接的活跃节点:")
 			foundPeers := false
 			for _, p := range h.Network().Peers() {
 				if p != h.ID() && p != globalRelayPeerID { // 排除自身和中继
-					// 额外判断是直接连接还是通过中继的连接
-					conn := h.Network().ConnsToPeer(p)
-					if len(conn) > 0 {
+					conns := h.Network().ConnsToPeer(p)
+					if len(conns) > 0 {
 						isRelayed := false
-						remoteAddr := conn[0].RemoteMultiaddr()
+						remoteAddr := conns[0].RemoteMultiaddr()
 						if remoteAddr != nil && strings.Contains(remoteAddr.String(), "/p2p-circuit") {
 							isRelayed = true
 						}
@@ -339,7 +341,7 @@ func readConsoleInput(h host.Host) {
 				}
 			}
 			if !foundPeers {
-				fmt.Println("  目前没有直接连接到其他对等节点。")
+				fmt.Println("  目前没有连接到其他对等节点。")
 			}
 		case "/exit":
 			fmt.Println("正在退出...")
@@ -429,10 +431,9 @@ func sendMessage(h host.Host, targetPeerID peer.ID, msg string) {
 		return
 	}
 
-	// === 新增：判断发送路径并记录日志 ===
+	// 判断发送路径并记录日志
 	conn := s.Conn()
 	isRelayed := false
-	// 检查连接的远程地址是否包含 p2p-circuit 段
 	remoteAddr := conn.RemoteMultiaddr()
 	if remoteAddr != nil && strings.Contains(remoteAddr.String(), "/p2p-circuit") {
 		isRelayed = true
@@ -445,6 +446,7 @@ func sendMessage(h host.Host, targetPeerID peer.ID, msg string) {
 	}
 }
 
+// connectToPeer 现在只处理通过 Multiaddr 连接，因为 /connect 命令将使用 Peer ID
 func connectToPeer(h host.Host, addr string) {
 	maddr, err := ma.NewMultiaddr(addr)
 	if err != nil {
@@ -463,12 +465,32 @@ func connectToPeer(h host.Host, addr string) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	fmt.Printf("尝试连接到 %s\n", peerInfo.ID)
+	fmt.Printf("尝试通过 Multiaddr 连接到 %s\n", peerInfo.ID)
 	if err := h.Connect(ctx, *peerInfo); err != nil {
 		fmt.Printf("连接失败到 %s: %v\n", peerInfo.ID, err)
 		return
 	}
-	fmt.Printf("成功连接到 %s\n", peerInfo.ID)
+	fmt.Printf("成功通过 Multiaddr 连接到 %s\n", peerInfo.ID)
+}
+
+// connectToPeerByID 是一个新的函数，用于通过 Peer ID 连接到其他节点
+func connectToPeerByID(h host.Host, targetPeerID peer.ID) {
+	// 检查 peerstore 中是否有该 Peer ID 的任何地址信息
+	peerInfo := h.Peerstore().PeerInfo(targetPeerID)
+	if len(peerInfo.Addrs) == 0 {
+		fmt.Printf("Peerstore 中没有找到 %s 的已知地址。请确保您已通过中继或 mDNS 发现它，或者使用 /connect <multiaddr>。", targetPeerID)
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	fmt.Printf("尝试连接到 Peer ID: %s (已知地址: %v)\n", targetPeerID, peerInfo.Addrs)
+	if err := h.Connect(ctx, peerInfo); err != nil {
+		fmt.Printf("连接失败到 %s: %v\n", targetPeerID, err)
+		return
+	}
+	fmt.Printf("成功连接到 %s\n", targetPeerID)
 }
 
 // genDebugKey 生成用于调试的固定私钥
@@ -501,7 +523,6 @@ func monitorConnections(h host.Host) {
 		foundChatPeers := false
 		for _, p := range h.Network().Peers() {
 			if p != h.ID() && p != globalRelayPeerID { // 排除自身和中继节点
-				// 额外判断是直接连接还是通过中继的连接
 				conns := h.Network().ConnsToPeer(p)
 				if len(conns) > 0 {
 					isRelayed := false
