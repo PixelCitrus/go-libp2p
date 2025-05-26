@@ -38,8 +38,8 @@ var (
 
 	// streams 维护持久化流
 	streams sync.Map
-	// relayPeerID holds the PeerID of the relay node, if connected.
-	// This is set once successfully connected to the relay.
+	// relayPeerID 保存已连接的中继节点的PeerID
+	// 成功连接到中继后设置此值
 	globalRelayPeerID peer.ID
 )
 
@@ -48,21 +48,13 @@ type discoveryNotifee struct {
 }
 
 func (n *discoveryNotifee) HandlePeerFound(pi peer.AddrInfo) {
-	// Add relay address to discovered peers if specified
+	// 如果指定了中继地址，尝试将其添加到发现的节点中
 	if *relayAddr != "" {
 		_, err := ma.NewMultiaddr(*relayAddr)
 		if err == nil {
-			// Extract just the address part, not the /p2p/peerid part
-			// The AddrInfoFromP2pAddr already adds the PeerID to the PeerInfo
-			// So, we just need the multiaddress to add to the peer's known addresses.
-			// However, in this context, pi.Addrs are the addresses the discovered peer
-			// advertises. If we want to connect to a peer *via* a relay, we add the relay
-			// address to the *relay info* when connecting to it, not to other discovered peers.
-			// This part is generally incorrect for adding a relay to other peers' AddrInfo,
-			// as the relay connection is usually established directly with the relay.
-			// The original intention here might have been to add the relay as an alternate
-			// route, but libp2p's relay mechanism handles that automatically if the relay
-			// is in the peerstore and reachable.
+			// 这里原本尝试将中继地址添加到发现节点的地址列表中
+			// 但实际上应该直接通过中继节点建立连接
+			// 现在保留空实现，因为libp2p的自动中继机制会处理中继连接
 		}
 	}
 
@@ -76,24 +68,28 @@ func (n *discoveryNotifee) HandlePeerFound(pi peer.AddrInfo) {
 	}
 }
 
+// 主函数入口
 func main() {
 	flag.Parse()
 	ctx := context.Background()
 
+	// 配置libp2p选项
 	opts := []libp2p.Option{
 		libp2p.ListenAddrStrings(
 			fmt.Sprintf("/ip4/0.0.0.0/tcp/%d", *port),
 			fmt.Sprintf("/ip6/::/tcp/%d", *port)),
-		libp2p.EnableRelay(),      // Enables relay dialing and listening
-		libp2p.NATPortMap(),       // Enables NAT port mapping
-		libp2p.EnableNATService(), // Enables NAT service for others to discover
-		libp2p.Ping(true),         // Enables ping service
+		libp2p.EnableRelay(),      // 启用中继拨号和监听
+		libp2p.NATPortMap(),       // 启用NAT端口映射
+		libp2p.EnableNATService(), // 启用NAT服务供其他节点发现
+		libp2p.Ping(true),         // 启用ping服务
 	}
 
+	// 调试模式下生成固定节点ID
 	if *debug {
 		opts = append(opts, libp2p.Identity(genDebugKey(*port)))
 	}
 
+	// 根据模式创建不同类型的节点
 	if *mode == relayMode {
 		createRelayNode(ctx, opts)
 	} else {
@@ -101,16 +97,17 @@ func main() {
 	}
 }
 
+// 创建中继节点
 func createRelayNode(ctx context.Context, opts []libp2p.Option) {
-	// For a relay node, we disable the client-side relay capability
-	// as it is providing the service.
+	// 对于中继节点，我们禁用客户端中继功能
+	// 因为它本身提供中继服务
 	opts = append(opts, libp2p.DisableRelay())
 	h, err := libp2p.New(opts...)
 	if err != nil {
 		log.Fatal(err)
 	}
 
-	// Start the relay service
+	// 启动中继服务
 	_, err = relayv2.New(h)
 	if err != nil {
 		log.Fatal("无法启动中继服务:", err)
@@ -121,33 +118,53 @@ func createRelayNode(ctx context.Context, opts []libp2p.Option) {
 		fmt.Printf("  %s/p2p/%s\n", addr, h.ID())
 	}
 
-	// Keep the relay node running indefinitely
+	// 保持中继节点持续运行
 	select {}
 }
 
+// createPeerNode 创建并启动一个普通P2P节点
+// 参数:
+//
+//	ctx: 上下文对象，用于控制goroutine生命周期
+//	opts: libp2p配置选项，包括监听地址、传输协议等
 func createPeerNode(ctx context.Context, opts []libp2p.Option) {
+	// 使用提供的选项创建libp2p主机实例
 	h, err := libp2p.New(opts...)
 	if err != nil {
 		log.Fatal(err)
 	}
 
+	// 设置节点发现服务(mDNS)
 	setupDiscovery(h)
-	connectToRelay(h) // This will also set globalRelayPeerID if successful
+	// 连接到中继节点(如果配置了中继地址)
+	// 连接成功后会将中继Peer ID存储到globalRelayPeerID
+	connectToRelay(h)
+	// 设置聊天协议处理器
 	setupChatProtocol(h)
 
+	// 打印节点启动信息
 	fmt.Printf("普通节点已启动:\nID: %s\n监听地址:\n", h.ID())
 	for _, addr := range h.Addrs() {
 		fmt.Println(" ", addr)
 	}
 
+	// 启动连接监控goroutine
 	go monitorConnections(h)
+	// 启动控制台输入读取goroutine
 	go readConsoleInput(h)
+	// 阻塞主线程，保持节点运行
 	select {}
 }
 
+// setupDiscovery 设置mDNS节点发现服务
+// 参数:
+//
+//	h: libp2p主机实例
 func setupDiscovery(h host.Host) {
-	// mDNS discovery for local peer discovery
+	// 创建mDNS发现服务实例
+	// rendezvous参数用于标识发现组，同一组的节点才能互相发现
 	discoveryService := discovery.NewMdnsService(h, *rendezvous, &discoveryNotifee{host: h})
+	// 启动发现服务
 	if err := discoveryService.Start(); err != nil {
 		log.Fatal("启动节点发现失败:", err)
 	}
@@ -165,8 +182,8 @@ func connectToRelay(h host.Host) {
 		log.Fatalf("解析中继地址失败: %v", err)
 	}
 
-	// Correctly parse the Peer ID from the multiaddr, if it contains one.
-	// AddrInfoFromP2pAddr is designed for multiaddrs like /ip4/127.0.0.1/tcp/4001/p2p/Qm...
+	// 从multiaddr中解析出Peer ID和地址信息
+	// AddrInfoFromP2pAddr专门用于处理包含/p2p/PeerID的multiaddr
 	relayInfo, err := peer.AddrInfoFromP2pAddr(maddr)
 	if err != nil {
 		log.Fatalf("获取中继信息失败: %v", err)
@@ -174,7 +191,7 @@ func connectToRelay(h host.Host) {
 
 	log.Printf("解析出的中继 Peer ID: %s, 地址: %v", relayInfo.ID, relayInfo.Addrs)
 
-	// Add the relay's addresses to our peerstore, so libp2p knows how to reach it.
+	// 将中继节点的地址添加到peerstore中，以便libp2p知道如何连接
 	h.Peerstore().AddAddrs(relayInfo.ID, relayInfo.Addrs, peerstore.PermanentAddrTTL)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -185,36 +202,41 @@ func connectToRelay(h host.Host) {
 		log.Fatalf("连接中继失败: %v", err)
 	}
 
-	// Store the relay's Peer ID globally once connected successfully
+	// 连接成功后，将中继节点的Peer ID存储到全局变量中
 	globalRelayPeerID = relayInfo.ID
 	fmt.Printf("成功连接到中继节点: %s\n", globalRelayPeerID)
 }
 
+// setupChatProtocol 设置聊天协议的处理逻辑
+// 参数:
+//
+//	h: libp2p主机实例
 func setupChatProtocol(h host.Host) {
-	// Set up a stream handler for the chat protocol
+	// 为聊天协议设置流处理器
 	h.SetStreamHandler(chatProtocol, func(s network.Stream) {
 		fmt.Printf("\n新连接来自: %s\n> ", s.Conn().RemotePeer())
-		// Store the new stream for potential future use (though not strictly necessary
-		// for reading, as readStream handles the current stream lifecycle).
-		// This ensures we can reply on this stream if needed.
+		// 存储新建立的流以便后续使用(虽然readStream会处理流的生命周期)
+		// 这样可以确保我们需要时能够通过这个流进行回复
 		streams.Store(s.Conn().RemotePeer(), s)
+		// 启动goroutine读取流中的数据
 		go readStream(s)
 	})
 	fmt.Println("聊天协议处理程序已设置。")
 }
 
+// 读取流数据
 func readStream(s network.Stream) {
-	// A stream should be closed by the party that initiates the closing.
-	// If the remote peer closes their side of the stream, ReadString will return an EOF error.
-	// We only close our side when we are done sending, or if an unrecoverable error occurs.
-	// defer s.Close() // Removed to keep the stream open for sending messages
+	// 流应由发起关闭的一方关闭
+	// 如果远端节点关闭了它们那端的流，ReadString会返回EOF错误
+	// 我们只在我们完成发送或发生不可恢复的错误时关闭我们这端的流
+	// defer s.Close() // 已移除以保持流开放用于发送消息
 
 	r := bufio.NewReader(s)
 	for {
 		msg, err := r.ReadString('\n')
 		if err != nil {
 			fmt.Printf("\n连接 %s 已关闭 (%v)\n> ", s.Conn().RemotePeer(), err)
-			streams.Delete(s.Conn().RemotePeer()) // Remove stream from map on disconnect
+			streams.Delete(s.Conn().RemotePeer()) // 断开连接时从map中移除流
 			return
 		}
 		fmt.Printf("\n[来自 %s] %s> ", s.Conn().RemotePeer(), msg)
@@ -293,25 +315,33 @@ func genDebugKey(port int) crypto.PrivKey {
 	return priv
 }
 
+// broadcastMessage 向所有连接的聊天节点广播消息
+// 参数:
+//
+//	h: libp2p主机实例
+//	msg: 要发送的消息内容
 func broadcastMessage(h host.Host, msg string) {
+	// 获取当前连接的所有节点
 	peers := h.Network().Peers()
 
-	// Filter out the relay node and self from the peers list for chat
+	// 过滤出可用于聊天的节点（排除中继节点和自身）
 	var chatPeers []peer.ID
 	for _, p := range peers {
-		// Exclude self and the designated relay peer
+		// 排除自身中和继节点
 		if p != h.ID() && (globalRelayPeerID == "" || p != globalRelayPeerID) {
 			chatPeers = append(chatPeers, p)
 		}
 	}
 
+	// 如果没有可聊天的节点，直接返回
 	if len(chatPeers) == 0 {
 		fmt.Println("没有其他可聊天的节点。")
 		return
 	}
 
+	// 遍历所有聊天节点发送消息
 	for _, p := range chatPeers {
-		// Attempt to load an existing stream
+		// 尝试加载已有的流
 		sVal, ok := streams.Load(p)
 		var s network.Stream
 		var err error
@@ -319,36 +349,42 @@ func broadcastMessage(h host.Host, msg string) {
 		if ok {
 			s, ok = sVal.(network.Stream)
 			if !ok {
-				// Type assertion failed, something is wrong with the stored value.
-				// Delete and recreate.
+				// 类型断言失败，存储的值有问题
+				// 删除并重新创建流
 				streams.Delete(p)
-				ok = false // Force stream recreation
+				ok = false // 强制重新创建流
 			}
 		}
 
-		if !ok || s == nil { // If no existing stream or type assertion failed
-			// Create a new stream to the peer
+		if !ok || s == nil { // 如果没有现有流或类型断言失败
+			// 创建到对等节点的新流
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			s, err = h.NewStream(ctx, p, chatProtocol)
-			cancel() // Release resources associated with the context
+			cancel() // 释放与上下文关联的资源
 
 			if err != nil {
 				fmt.Printf("无法创建流到 %s: %v\n", p, err)
-				// Do not store invalid stream, and continue to next peer
+				// 不存储无效流，继续下一个节点
 				continue
 			}
-			streams.Store(p, s) // Store the new stream
-			go readStream(s)    // Start reading from this new stream
+			streams.Store(p, s) // 存储新流
+			go readStream(s)    // 开始从这个新流读取
 			fmt.Printf("已建立新流到 %s\n", p)
 		}
 
-		// Send the message
+		// 发送消息
 		_, err = s.Write([]byte(msg + "\n"))
 		if err != nil {
 			fmt.Printf("发送失败到 %s: %v\n", p, err)
-			streams.Delete(p) // Remove the stream if writing fails
-			// Consider re-establishing stream on next broadcast if desirable,
-			// or have readStream handle this. For now, it's removed.
+			streams.Delete(p) // 如果写入失败则删除流
+			// 可以考虑在下一次广播时重新建立流
+		}
+
+		// 记录消息是直接发送还是通过中继发送
+		if globalRelayPeerID != "" && p == globalRelayPeerID {
+			fmt.Printf("消息通过中继发送到 %s\n", p)
+		} else {
+			fmt.Printf("消息直接发送到 %s\n", p)
 		}
 	}
 }
