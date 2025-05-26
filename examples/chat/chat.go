@@ -37,6 +37,7 @@ import (
 	"log"
 	mrand "math/rand"
 	"os"
+	"strings"
 
 	"github.com/libp2p/go-libp2p"
 	"github.com/libp2p/go-libp2p/core/crypto"
@@ -156,13 +157,14 @@ func makeHost(port int, randomness io.Reader) (host.Host, error) {
 		return nil, err
 	}
 
-	// 0.0.0.0 will listen on any interface device.
-	sourceMultiAddr, _ := multiaddr.NewMultiaddr(fmt.Sprintf("/ip4/0.0.0.0/tcp/%d", port))
+	// Listen on both IPv4 and IPv6 interfaces
+	ipv4Addr, _ := multiaddr.NewMultiaddr(fmt.Sprintf("/ip4/0.0.0.0/tcp/%d", port))
+	ipv6Addr, _ := multiaddr.NewMultiaddr(fmt.Sprintf("/ip6/::/tcp/%d", port))
 
 	// libp2p.New constructs a new libp2p Host.
 	// Other options can be added here.
 	return libp2p.New(
-		libp2p.ListenAddrs(sourceMultiAddr),
+		libp2p.ListenAddrs(ipv4Addr, ipv6Addr),
 		libp2p.Identity(prvKey),
 	)
 }
@@ -187,10 +189,25 @@ func startPeer(ctx context.Context, h host.Host, streamHandler network.StreamHan
 		return
 	}
 
-	log.Printf("Run './chat -d /ip4/127.0.0.1/tcp/%v/p2p/%s' on another console.\n", port, h.ID())
-	log.Println("You can replace 127.0.0.1 with public IP as well.")
+	log.Printf("Run one of the following commands on another console:\n")
+	log.Printf("IPv4: './chat -d /ip4/127.0.0.1/tcp/%v/p2p/%s'\n", port, h.ID())
+	log.Printf("IPv6: './chat -d /ip6/::1/tcp/%v/p2p/%s'\n", port, h.ID())
+	log.Println("Note: You can replace 127.0.0.1 with public IPv4 or ::1 with public IPv6 address.")
 	log.Println("Waiting for incoming connection")
 	log.Println()
+}
+
+// removeIPv6ZoneIndex removes the zone index from an IPv6 address string
+// e.g., "fe80::1%eth0" becomes "fe80::1"
+func removeIPv6ZoneIndex(addr string) string {
+	if idx := strings.Index(addr, "%"); idx != -1 {
+		// Find the next component separator after the % sign
+		if end := strings.Index(addr[idx:], "/"); end != -1 {
+			return addr[:idx] + addr[idx+end:]
+		}
+		return addr[:idx]
+	}
+	return addr
 }
 
 func startPeerAndConnect(ctx context.Context, h host.Host, destination string) (*bufio.ReadWriter, error) {
@@ -201,6 +218,8 @@ func startPeerAndConnect(ctx context.Context, h host.Host, destination string) (
 	log.Println()
 
 	// Turn the destination into a multiaddr.
+	// For IPv6 addresses, we need to handle zone indices
+	destination = removeIPv6ZoneIndex(destination)
 	maddr, err := multiaddr.NewMultiaddr(destination)
 	if err != nil {
 		log.Println(err)
